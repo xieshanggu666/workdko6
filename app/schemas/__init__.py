@@ -31,6 +31,8 @@ class ResidentOut(BaseModel):
     away: int = 0
     # 贸易订单角色：transporting=在途押运；reviewing=待出发押运；None=无订单
     trade_status: Optional[str] = None
+    # 在册病例阶段：registered/treating/isolated/recovering；None=无病例
+    case_stage: Optional[str] = None
     joined_day: int
 
     class Config:
@@ -77,6 +79,8 @@ class SessionDetail(BaseModel):
     expedition: Optional[Dict[str, Any]] = None
     # 当前贸易/救援订单快照（审核中/在途），终局后清空
     trade_order: Optional[Dict[str, Any]] = None
+    # 医疗救治中心快照：在册病例（含阶段/类型/疗程）与收治容量信息
+    medical: Optional[Dict[str, Any]] = None
     # 地堡对外信誉 0-100，影响外部聚落审核/交付
     reputation: int = 50
     residents: List[ResidentOut] = []
@@ -139,6 +143,22 @@ class TradeCancel(BaseModel):
 
 class JobAssign(BaseModel):
     job: str
+
+
+class MedicalRegister(BaseModel):
+    """手动登记病例：case_type 为 injury（外伤）或 disease（疫病）。"""
+    case_type: str
+
+
+class MedicalInfo(BaseModel):
+    """医疗救治中心当前概况：床位/医护容量与各阶段病例数。"""
+    capacity: int
+    treating: int
+    registered: int
+    isolated: int
+    recovering: int
+    medic_count: int
+    has_clinic: bool
 
 
 class BuildRequest(BaseModel):

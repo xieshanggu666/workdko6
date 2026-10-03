@@ -26,7 +26,8 @@ FACILITY_OUTPUT = {
     "water": {WATER: 7.0, POWER: -1.0}, # 净水器产水，耗电
     "power": {POWER: 8.0},              # 发电机产电
     "oxygen": {OXY: 6.0, POWER: -1.0},  # 水培/制氧耗电产氧
-    "med": {},                          # 医疗：加速回复健康，微耗电
+    "med": {},                          # 医疗舱：全员被动微量回血
+    "clinic": {POWER: -2.0},            # 医疗救治中心：床位收治病例，按等级耗电
     "storage": {},                      # 仓库：降低损耗
 }
 FACILITY_LEVEL_SCALE = 1.6  # 升级产出按比例放大
@@ -37,7 +38,9 @@ FACILITY_COST = {  # 建造/升级消耗 builder cost
 }
 
 # 岗位
-JOB_EFFICIENCY = {"engineer": 1.25, "farmer": 1.3, "general": 1.0}
+# engineer/farmer/general 参与设施产出加成；medic（医护）不加成产出，
+# 而是为医疗救治中心提供医护容量（无中心时也可野战救治）与疗效加成
+JOB_EFFICIENCY = {"engineer": 1.25, "farmer": 1.3, "general": 1.0, "medic": 1.0}
 
 # 危机事件概率
 CRISIS_DAY_CHANCE = 0.45
@@ -57,6 +60,36 @@ TRADE_INITIAL_REPUTATION = 50      # 新档案初始信誉
 TRADE_MAX_ESCORTS = 3              # 每笔订单押运队上限
 TRADE_INCIDENT_CHANCE = 0.55       # 每个在途日触发途中事件的概率
 TRADE_REP_MIN, TRADE_REP_MAX = 0, 100
+
+# 医疗救治中心系统
+# 病例状态链：registered（已登记待收治）→ treating（住院治疗）/ isolated（隔离）
+#   → recovering（恢复观察，可提前归队）→ 观察期满自动出院；
+#   病例全程占用居民（不参与生产、不能离堡），死亡则归档移除
+CASE_REGISTERED, CASE_TREATING, CASE_ISOLATED, CASE_RECOVERING = (
+    "registered", "treating", "isolated", "recovering",
+)
+CASE_TYPES = ("injury", "disease")          # 伤病：外伤 / 疫病
+CASE_SEVERE_THRESHOLD = 40.0                # 健康低于此值为重症，疗效打折
+CASE_RECOVER_DAYS = 2                       # 恢复观察天数，期满自动出院
+CASE_REGISTER_THRESHOLD = 50.0              # 危机/离队结算后自动登记的健康阈值
+# 每日病例消耗（人均）：治疗病例全套医护消耗；登记未收治与隔离病例仅基础照护
+CARE_COST_TREATING = {FOOD: 1.0, WATER: 1.0, POWER: 1.5}
+CARE_COST_OTHER = {FOOD: 0.5, WATER: 0.5, POWER: 0.25}
+# 每日疗效（健康回复）：治疗 / 隔离 / 恢复观察
+CARE_HEAL_TREATING, CARE_HEAL_ISOLATED, CARE_HEAL_RECOVERING = 8.0, 3.0, 5.0
+# 未收治登记病例每日健康恶化与士气打击
+CARE_NEGLECT_HEALTH, CARE_NEGLECT_MORALE = -3.0, -2.0
+# 病例每日士气变化：被收治略有慰藉，长期观察微压
+CARE_MORALE_TREATING, CARE_MORALE_OTHER = 0.5, -0.5
+CARE_RATION_FACTOR = 0.3                    # 物资限额时疗效仅三成，并伴随虚弱/士气下降
+CARE_RATION_HEALTH, CARE_RATION_MORALE = -2.0, -2.0
+CARE_PROGRESS_PER_DAY = 34.0                # 治疗病例每日疗程进度（满 100 转入恢复）
+# 未隔离疫病病例每日向在堡健康居民传染的概率（每名医护 -2%）
+CARE_SPREAD_BASE = 0.15
+CARE_SPREAD_MEDIC_REDUCTION = 0.02
+CARE_SPREAD_MAX_NEW = 1                     # 每日至多新增 1 例传染
+CLINIC_BASE_BEDS = 2                        # 医疗救治中心 Lv.1 床位数
+MEDIC_FIELD_CAPACITY = 1                    # 无救治中心时每名医护的野战救治容量
 
 
 def _clamp(v, lo=0.0, hi=100.0):
@@ -150,7 +183,12 @@ class BunkerEngine:
 
     def job_count(self, job):
         away = self._away_resident_ids()
-        return sum(1 for r in self.session.residents if r.alive and r.job == job and r.id not in away)
+        hospitalized = self._hospitalized_ids()
+        return sum(
+            1
+            for r in self.session.residents
+            if r.alive and r.job == job and r.id not in away and r.id not in hospitalized
+        )
 
     def active_facilities(self):
         return [f for f in self.session.facilities if f.status == "active"]
@@ -195,6 +233,99 @@ class BunkerEngine:
     def _in_bunker_count(self):
         return len(self._in_bunker_residents())
 
+    # ---- 医疗救治中心：病例追踪 ----
+    def _medical(self):
+        med = self.session.medical
+        return med if isinstance(med, dict) else {"cases": {}}
+
+    def _save_medical(self, med):
+        # 整体回写并显式标记变更：从数据库新加载的 JSON 是普通 dict（尚未被
+        # MutableDict 包裹），直接替换属性不会进入脏检查，flag_modified 保证
+        # 嵌套病例的 stage/progress 修改在 commit 时一定随 UPDATE 落库
+        import copy
+        from sqlalchemy.orm.attributes import flag_modified
+        self.session.medical = copy.deepcopy({"cases": dict(med.get("cases", {}))})
+        flag_modified(self.session, "medical")
+
+    def _cases(self):
+        """当前全部在册病例（dict：resident_id(str) → case）。"""
+        med = self._medical()
+        cases = med.get("cases", {})
+        return cases if isinstance(cases, dict) else {}
+
+    def _case_of(self, resident_id):
+        return self._cases().get(str(resident_id))
+
+    def _hospitalized_ids(self):
+        """在册病例（任何阶段）都视为住院：不参与生产、不能离堡。"""
+        return {int(k) for k in self._cases().keys()}
+
+    def _resident_by_id(self, resident_id):
+        return next((r for r in self.session.residents if r.id == resident_id), None)
+
+    def _clinic(self):
+        """当前生效的医疗救治中心（取最高等级的一座）。"""
+        clinics = [f for f in self.session.facilities if f.category == "clinic" and f.status == "active"]
+        return max(clinics, key=lambda f: f.level, default=None)
+
+    def treatment_capacity(self):
+        """住院治疗容量：救治中心床位 + 医护人力；无中心时每名医护可野战收治 1 人。
+
+        只有 treating（治疗中）病例占用容量；登记待收治/隔离/恢复观察不占床位。
+        """
+        clinic = self._clinic()
+        if clinic is None:
+            return self.job_count("medic") * MEDIC_FIELD_CAPACITY
+        beds = CLINIC_BASE_BEDS + clinic.level
+        # 每名医护额外增加一个人力位
+        return beds + self.job_count("medic")
+
+    def _active_case_ids(self, stages):
+        return [int(k) for k, c in self._cases().items() if c.get("stage") in stages]
+
+    def _register_case(self, resident_id, case_type, source, severity=None):
+        """为居民登记病例（幂等：已有在册病例时不重复登记）。
+
+        severity 缺省按登记时健康判定（<40 为重症）。返回是否新登记。
+        """
+        r = self._resident_by_id(resident_id)
+        if not r or not r.alive:
+            return False
+        if self._case_of(resident_id) is not None:
+            return False
+        if case_type not in CASE_TYPES:
+            case_type = "injury"
+        sev = severity if severity is not None else ("severe" if r.health < CASE_SEVERE_THRESHOLD else "mild")
+        case = {
+            "type": case_type,
+            "stage": CASE_REGISTERED,
+            "severity": sev,
+            "source": source,
+            "registered_day": self.session.day,
+            "progress": 0.0,
+            "recover_days": 0,
+        }
+        med = self._medical()
+        med.setdefault("cases", {})[str(resident_id)] = case
+        self._save_medical(med)
+        self._log(
+            "system", "病例登记",
+            f"{r.name} 被登记为{CASE_TYPE_ZH[case_type]}病例（{CASE_SEVERITY_ZH[sev]}），等待收治。",
+            decision="登记",
+        )
+        return True
+
+    def _remove_case(self, resident_id, med=None):
+        """归档移除病例（出院/死亡）。返回是否发生移除。"""
+        med = med or self._medical()
+        cases = med.setdefault("cases", {})
+        if str(resident_id) in cases:
+            del cases[str(resident_id)]
+            if med is not None:
+                self._save_medical(med)
+            return True
+        return False
+
     # ---- 每日推进 ----
     def advance_day(self):
         # 终局或存在待处理抉择（危机/探索遭遇）时都不能推进：抉择不可被"再点一天"跳过
@@ -206,6 +337,9 @@ class BunkerEngine:
         pre_verdict = self._end_verdict()
         self._apply_production_and_consumption()
         self._apply_health_morale()
+        # 医疗救治中心：病例每日消耗物资、推进疗程、疫病传播与死亡归档。
+        # 与每日健康结算同一口径只作用于在堡居民（探索队/押运队不在此列）
+        self._apply_medical_care()
         exp = self.session.expedition
         if exp and exp.get("status") == "away":
             # 探索队在外出差：地堡按在堡人口结算，探索队消耗自带物资、行军并触发遭遇
@@ -308,6 +442,7 @@ class BunkerEngine:
     def _apply_health_morale(self):
         res = self.get_resources()
         away = self._away_resident_ids()
+        hospitalized = self._hospitalized_ids()
         # 资源不足影响（仅作用于在堡居民；探索队吃自带物资，不受地堡短缺波及）
         for r in self.session.residents:
             if not r.alive:
@@ -319,8 +454,9 @@ class BunkerEngine:
             for k, name in ((FOOD, "食物"), (WATER, "水源"), (OXY, "氧气"), (POWER, "电力")):
                 if res.get(k, 0) <= 15:
                     morale -= 2.0
-            # 医疗站回复 + 保持士气
-            if self.has_category("med"):
+            # 医疗站被动回血只覆盖非住院居民：在册病例由医疗救治中心按阶段结算，
+            # 避免被动回血与疗程回复叠加
+            if self.has_category("med") and r.id not in hospitalized:
                 if r.health < 100:
                     r.health = _clamp(r.health + 1.2)
             # 低健康拖累士气
@@ -351,6 +487,9 @@ class BunkerEngine:
         weakest.alive = 0
         weakest.health = 0
         self.session.survivors -= 1
+        # 死亡居民的在册病例同步归档，不留悬挂病例
+        if self._case_of(weakest.id) is not None:
+            self._remove_case(weakest.id)
         self._log("crisis", "生存危机：资源耗尽", f"{weakest.name} 因匮乏失去生命。", decision="自然事件")
 
     def avg_morale(self, in_bunker_only=False):
@@ -378,6 +517,288 @@ class BunkerEngine:
                 decision=decision,
             )
         )
+
+    # ---- 医疗救治中心：每日医护结算 ----
+    def _apply_medical_care(self):
+        """病例每日结算：自动收治、资源消耗、疗程推进、疫病传播与死亡归档。
+
+        病例全程按在堡口径（在册居民不允许离堡）：
+          registered  已登记待收治：容量内自动转入 treating；未收治者健康恶化
+          treating    住院治疗：消耗全套医护物资，疗程进度满 100 转入恢复
+          isolated    隔离（仅疫病）：消耗基础照护物资，疗程缓慢推进，不传染
+          recovering  恢复观察：观察满 CASE_RECOVER_DAYS 自动出院
+        任一资源不足以支付当日全部病例开销时，全体病例按“限额救治”结算：
+        疗效仅三成并伴随健康/士气下降。未隔离疫病每日有概率传染一名在堡居民。
+        """
+        med = self._medical()
+        cases = med.setdefault("cases", {})
+        if not cases:
+            return
+        away = self._away_resident_ids()
+
+        # 1) 清理悬空病例：已故/离堡（正常流程带不出病例，这里兜底旧存档）
+        for key in [ck for ck in list(cases.keys())]:
+            rid = int(key)
+            r = self._resident_by_id(rid)
+            if r is None or not r.alive or rid in away:
+                cases.pop(key, None)
+        if not cases:
+            self._save_medical(med)
+            return
+        # 2) 自动收治：容量内按登记先后把待收治病例转入治疗
+        treating_ids = [int(ck) for ck, c in cases.items() if c["stage"] == CASE_TREATING]
+        free_cap = self.treatment_capacity() - len(treating_ids)
+        if free_cap > 0:
+            waiting = sorted(
+                ((int(ck), c) for ck, c in cases.items() if c["stage"] == CASE_REGISTERED),
+                key=lambda kv: (kv[1].get("registered_day", 0), kv[0]),
+            )
+            for rid, case in waiting[:free_cap]:
+                case["stage"] = CASE_TREATING
+                r = self._resident_by_id(rid)
+                self._log(
+                    "system", "医疗收治",
+                    f"{r.name if r else '居民'} 转入医疗救治中心接受治疗。",
+                    decision="自动收治",
+                )
+
+        # 3) 汇总当日医护开销（治疗病例全套，其余阶段基础照护）
+        overhead = {rk: 0.0 for rk in RESOURCE_KEYS}
+        for c in cases.values():
+            table = CARE_COST_TREATING if c["stage"] == CASE_TREATING else CARE_COST_OTHER
+            for rk in RESOURCE_KEYS:
+                overhead[rk] += table.get(rk, 0.0)
+        res = self.get_resources()
+        rationed = any(res.get(rk, 0) < overhead[rk] for rk in RESOURCE_KEYS)
+        for rk in RESOURCE_KEYS:
+            if overhead[rk] > 0:
+                self._add_resource(rk, -overhead[rk])
+
+        # 4) 逐病例推进疗程/健康/士气
+        medic_boost = 1.0 + 0.15 * self.job_count("medic")
+        recovered_names, discharged_names, death_names = [], [], []
+        for key in list(cases.keys()):
+            rid = int(key)
+            r = self._resident_by_id(rid)
+            if r is None or not r.alive:
+                cases.pop(key, None)
+                continue
+            case = cases[key]
+            stage = case["stage"]
+            if rationed:
+                # 限额救治：物资只够维持生命，疗效大打折扣
+                r.morale = _clamp(r.morale + CARE_RATION_MORALE)
+            if stage == CASE_REGISTERED:
+                # 仍未收治：病情拖延、士气受挫
+                r.health = _clamp(r.health + CARE_NEGLECT_HEALTH)
+                r.morale = _clamp(r.morale + CARE_NEGLECT_MORALE)
+            elif stage == CASE_TREATING:
+                heal = CARE_HEAL_TREATING
+                if case.get("severity") == "severe":
+                    heal *= 0.6  # 重症疗程更慢
+                heal *= medic_boost
+                if rationed:
+                    heal *= CARE_RATION_FACTOR
+                    r.health = _clamp(r.health + CARE_RATION_HEALTH)
+                r.health = _clamp(r.health + heal)
+                if not rationed:
+                    r.morale = _clamp(r.morale + CARE_MORALE_TREATING)
+                progress_gain = CARE_PROGRESS_PER_DAY * (0.6 if case.get("severity") == "severe" else 1.0)
+                if rationed:
+                    progress_gain *= CARE_RATION_FACTOR
+                case["progress"] = round(case.get("progress", 0.0) + progress_gain, 1)
+                if case["progress"] >= 100.0:
+                    case["stage"] = CASE_RECOVERING
+                    case["recover_days"] = 0
+                    recovered_names.append(r.name)
+            elif stage == CASE_ISOLATED:
+                heal = CARE_HEAL_ISOLATED * (CARE_RATION_FACTOR if rationed else 1.0)
+                r.health = _clamp(r.health + heal)
+                r.morale = _clamp(r.morale + CARE_MORALE_OTHER)
+                case["progress"] = round(
+                    case.get("progress", 0.0) + 20.0 * (CARE_RATION_FACTOR if rationed else 1.0), 1
+                )
+                if case["progress"] >= 100.0:
+                    case["stage"] = CASE_RECOVERING
+                    case["recover_days"] = 0
+                    recovered_names.append(r.name)
+            elif stage == CASE_RECOVERING:
+                r.health = _clamp(r.health + CARE_HEAL_RECOVERING * (CARE_RATION_FACTOR if rationed else 1.0))
+                r.morale = _clamp(r.morale + CARE_MORALE_OTHER)
+                case["recover_days"] = int(case.get("recover_days", 0)) + 1
+                if case["recover_days"] >= CASE_RECOVER_DAYS:
+                    cases.pop(key, None)
+                    discharged_names.append(r.name)
+            # 健康归零：病例不治身亡（人口扣减、病例归档）
+            if r.health <= 0 and r.alive:
+                r.alive = 0
+                r.health = 0
+                self.session.survivors = max(0, self.session.survivors - 1)
+                cases.pop(key, None)
+                death_names.append(r.name)
+
+        # 5) 疫病传播：未隔离且未住院（登记待收治/恢复观察）的疫病病例可能传染
+        spread_chance = max(
+            0.0, CARE_SPREAD_BASE - CARE_SPREAD_MEDIC_REDUCTION * self.job_count("medic")
+        )
+        spread_sources = [
+            int(ck) for ck, c in cases.items()
+            if c.get("type") == "disease" and c["stage"] in (CASE_REGISTERED, CASE_RECOVERING)
+        ]
+        new_cases = 0
+        if spread_sources and spread_chance > 0:
+            case_ids = {int(ck) for ck in cases.keys()}
+            susceptible = [
+                r for r in self._in_bunker_residents()
+                if r.id not in case_ids and r.health < 100
+            ]
+            for src in spread_sources:
+                if new_cases >= CARE_SPREAD_MAX_NEW or not susceptible:
+                    break
+                if self.rand.random() < spread_chance:
+                    victim = self.rand.choice(susceptible)
+                    # 在当前工作快照上直接登记（不经过 _register_case 的整列回写，
+                    # 避免把前面已推进的疗程/阶段修改从旧快照里覆盖掉）
+                    if self._case_of(victim.id) is None and victim.alive:
+                        sev = "severe" if victim.health < CASE_SEVERE_THRESHOLD else "mild"
+                        cases[str(victim.id)] = {
+                            "type": "disease", "stage": CASE_REGISTERED, "severity": sev,
+                            "source": "疫病传播", "registered_day": self.session.day,
+                            "progress": 0.0, "recover_days": 0,
+                        }
+                        self._log(
+                            "system", "病例登记",
+                            f"{victim.name} 被未隔离病例传染，登记为疫病病例。",
+                            decision="传染",
+                        )
+                        new_cases += 1
+                        susceptible = [r for r in susceptible if r.id != victim.id]
+
+        # 6) 日志：每日一条汇总
+        treating_now = [int(ck) for ck, c in cases.items() if c["stage"] == CASE_TREATING]
+        parts = [f"在治 {len(treating_now)} 例"]
+        if rationed:
+            parts.append("医护物资不足，全体限额救治")
+        if recovered_names:
+            parts.append("转入恢复：" + "、".join(recovered_names))
+        if discharged_names:
+            parts.append("康复出院：" + "、".join(discharged_names))
+        if new_cases:
+            parts.append(f"新增传染 {new_cases} 例")
+        if death_names:
+            parts.append("不治：" + "、".join(death_names))
+        self._log("update", f"第{self.session.day}天 · 医疗救治中心", "，".join(parts), decision="医护日报")
+        # 整次结算只回写一次：深拷贝确保嵌套病例的所有原地修改都被 MutableDict 追踪
+        self._save_medical(med)
+
+    # ---- 医疗救治中心：玩家操作 ----
+    def medical_register(self, resident_id, case_type):
+        """手动登记病例：健康低于 60 的在堡存活居民可登记为外伤/疫病。"""
+        self._require_daily_phase("登记病例")
+        if case_type not in CASE_TYPES:
+            raise BunkerEngineError("未知病例类型")
+        r = self._resident_by_id(resident_id)
+        if not r or not r.alive:
+            raise BunkerEngineError("居民不存在或已故")
+        if r.id in self._away_resident_ids():
+            raise BunkerEngineError("离堡居民无法登记病例")
+        if self._case_of(resident_id) is not None:
+            raise BunkerEngineError("该居民已有在册病例")
+        if r.health >= 60:
+            raise BunkerEngineError("该居民健康状况尚可，无需登记病例")
+        self._register_case(resident_id, case_type, source="人工登记")
+
+    def medical_treat(self, resident_id):
+        """收治/解除隔离转住院：登记待收治或隔离中的疫病病例转入住院治疗（占用容量）。"""
+        self._require_daily_phase("收治病人")
+        case = self._require_case(resident_id)
+        if case["stage"] not in (CASE_REGISTERED, CASE_ISOLATED):
+            raise BunkerEngineError("仅待收治或隔离中的病例可以转入住院治疗")
+        treating = len(self._active_case_ids((CASE_TREATING,)))
+        if treating >= self.treatment_capacity():
+            raise BunkerEngineError("医疗救治中心容量已满（升级设施或增配医护）")
+        med = self._medical()
+        med["cases"][str(resident_id)]["stage"] = CASE_TREATING
+        self._save_medical(med)
+        r = self._resident_by_id(resident_id)
+        self._log("system", "医疗收治", f"{r.name} 转入住院治疗。", decision="收治")
+
+    def medical_isolate(self, resident_id):
+        """隔离观察：仅疫病病例可隔离；登记待收治或治疗中的病例转入隔离。"""
+        self._require_daily_phase("隔离病例")
+        case = self._require_case(resident_id)
+        if case.get("type") != "disease":
+            raise BunkerEngineError("外伤病例无需隔离，只有疫病病例可以隔离")
+        if case["stage"] not in (CASE_REGISTERED, CASE_TREATING):
+            raise BunkerEngineError("该病例当前阶段无法隔离")
+        med = self._medical()
+        med["cases"][str(resident_id)]["stage"] = CASE_ISOLATED
+        self._save_medical(med)
+        r = self._resident_by_id(resident_id)
+        self._log("system", "隔离观察", f"{r.name} 转入隔离观察，切断疫病传播。", decision="隔离")
+
+    def medical_discharge(self, resident_id):
+        """提前出院：仅恢复观察中的病例可提前结束观察、立即归队。"""
+        self._require_daily_phase("安排出院")
+        case = self._require_case(resident_id)
+        if case["stage"] != CASE_RECOVERING:
+            raise BunkerEngineError("仅恢复观察中的病例可以提前出院")
+        self._remove_case(resident_id)
+        r = self._resident_by_id(resident_id)
+        self._log("system", "康复归队", f"{r.name} 结束恢复观察，提前归队。", decision="出院")
+
+    def _require_case(self, resident_id):
+        r = self._resident_by_id(resident_id)
+        if not r or not r.alive:
+            raise BunkerEngineError("居民不存在或已故")
+        if r.id in self._away_resident_ids():
+            raise BunkerEngineError("离堡居民没有在册病例")
+        case = self._case_of(resident_id)
+        if case is None:
+            raise BunkerEngineError("该居民没有在册病例")
+        return case
+
+    # ---- 危机/离队结算后的健康结算（病例登记联动） ----
+    def _settle_health_after_crisis(self, event_key, choice_key, target):
+        """地堡危机抉择结算后的健康结算：疫病确诊登记，重伤员自动登记外伤。
+
+        - 疫病·隔离治疗：目标即确诊病人，直接进入隔离观察（已有疫病病例则改判隔离）
+        - 疫病·全员消毒：仍有小概率疏漏，目标被登记为疫病
+        - 其他危机：单体健康伤害把目标打到阈值以下时，自动登记外伤
+        幂等：同一病例不重复登记。
+        """
+        if event_key == "sick" and choice_key == "quarantine" and target is not None:
+            existing = self._case_of(target.id)
+            if existing is None:
+                self._register_case(target.id, "disease", source="疫病确诊")
+            elif existing.get("type") == "disease" and existing["stage"] in (
+                CASE_REGISTERED, CASE_TREATING
+            ):
+                pass  # 已在册疫病：下方统一改判隔离
+            else:
+                return
+            med = self._medical()
+            if str(target.id) in med.get("cases", {}):
+                med["cases"][str(target.id)]["stage"] = CASE_ISOLATED
+                self._save_medical(med)
+            return
+        if event_key == "sick" and choice_key == "public_health" and target is not None:
+            # 全员消毒大幅压低扩散，但仍有四成概率消毒不彻底、确诊者需登记
+            if self.rand.random() < 0.4:
+                self._register_case(target.id, "disease", source="消毒后仍有疏漏")
+            return
+        if target is not None and target.alive and target.health < CASE_REGISTER_THRESHOLD:
+            self._register_case(target.id, "injury", source="危机伤员")
+
+    def _settle_health_for_residents(self, resident_ids, source, threshold=CASE_REGISTER_THRESHOLD):
+        """探索队返程 / 押运队返程后的健康结算：阈值以下成员自动登记外伤病例。
+
+        已有在册病例（离堡不可能带病例，兜底旧存档）不重复登记。
+        """
+        for rid in resident_ids:
+            r = self._resident_by_id(rid)
+            if r and r.alive and r.health < threshold:
+                self._register_case(rid, "injury", source=source)
 
     # ---- 危机轮盘 ----
 
@@ -605,6 +1026,17 @@ class BunkerEngine:
             "day": pending.get("day"),
             "detail": detail,
         }
+        # 危机后的健康结算：疫病确诊登记/隔离，重伤员自动登记病例。
+        # 全员消毒的效果作用域是全体（target=None），但疫病危机快照始终绑定
+        # 一名疑似病人，结算以该绑定居民为准
+        health_target = target
+        if health_target is None and event_key == "sick":
+            bound_id = pending.get("target_id")
+            if bound_id is not None:
+                health_target = next(
+                    (x for x in self.session.residents if x.id == bound_id and x.alive), None
+                )
+        self._settle_health_after_crisis(event["key"], choice["key"], health_target)
         self._check_end()
         return detail, False
 
@@ -668,6 +1100,8 @@ class BunkerEngine:
                 raise BunkerEngineError("队员不存在或已故，无法参加探索队")
             if r.id in self._away_resident_ids():
                 raise BunkerEngineError(f"{r.name} 已在探索队中")
+            if self._case_of(r.id) is not None:
+                raise BunkerEngineError(f"{r.name} 有在册病例，住院期间不能离堡")
             members.append(r)
         # 校验并扣除自带物资
         supply_cost = {}
@@ -1078,6 +1512,10 @@ class BunkerEngine:
             detail_parts.append("全员平安归来")
         detail = "；".join(detail_parts)
         self._log("system", f"探索队返程（{reason}）", detail, decision="返程结算")
+        # 返程后的健康结算：阈值以下成员登记外伤病例（仅对存活归队者）
+        self._settle_health_for_residents(
+            [r.id for r in members if r.alive], source="探索返程伤员"
+        )
         # 先写档案级幂等凭据，再清除探索队状态：凭据在队伍消失后依然可查
         self._remember_expedition(
             self._EXP_ACT_RETURN, enc_token, detail,
@@ -1187,6 +1625,8 @@ class BunkerEngine:
                 raise BunkerEngineError("押运队员不存在或已故")
             if r.id in self._away_resident_ids():
                 raise BunkerEngineError(f"{r.name} 已离堡，无法参加押运")
+            if self._case_of(r.id) is not None:
+                raise BunkerEngineError(f"{r.name} 有在册病例，住院期间不能参加押运")
         if not self._can_afford(offer["escrow"]):
             raise BunkerEngineError("托管物资不足，无法申请该订单")
         # 冻结托管物资（审核驳回/撤单/失败回退时按规则退还）
@@ -1597,6 +2037,10 @@ class BunkerEngine:
             title = f"采购到货·{order['partner_name']}"
         detail = "；".join(parts)
         self._log("trade", title, f"{reason}。{detail}", decision="交付结算")
+        # 交付后的健康结算：押运队员带伤归队，阈值以下登记外伤病例
+        self._settle_health_for_residents(
+            [r.id for r in self._trade_escorts(order) if r.alive], source="押运返程伤员"
+        )
         self._remember_trade(self._TRADE_ACT_SETTLE, None, detail, order_token=order.get("token"))
         # 用交付前快照收敛终局
         self.session.trade_order = None
@@ -1631,6 +2075,10 @@ class BunkerEngine:
             parts.append(f"殉职：{'、'.join(dead)}")
         detail = "；".join(parts)
         self._log("trade", f"订单失败·{order['partner_name']}", f"{reason}。{detail}", decision="失败回退")
+        # 失败回退后的健康结算：幸存押运队员带伤归队，阈值以下登记外伤病例
+        self._settle_health_for_residents(
+            [r.id for r in self._trade_escorts(order) if r.alive], source="押运返程伤员"
+        )
         self._remember_trade(
             self._TRADE_ACT_SETTLE, inc_token, detail,
             order_token=order.get("token"), choice_key=inc_choice,
@@ -1691,6 +2139,8 @@ class BunkerEngine:
             raise BunkerEngineError("居民不存在或已故")
         if r.id in self._away_resident_ids():
             raise BunkerEngineError("探索队中的居民无法调整岗位")
+        if self._case_of(r.id) is not None:
+            raise BunkerEngineError("住院病例不能调整岗位，康复出院后恢复")
         r.job = job
 
     # ---- 结局判定 ----
@@ -1716,10 +2166,11 @@ class BunkerEngine:
         if self.session.status != "running":
             return
         self.session.status = "win" if win else "over"
-        # 进入终局后不存在悬而未决的抉择/在外队伍/在途订单，状态机统一收敛到 ended
+        # 进入终局后不存在悬而未决的抉择/在外队伍/在途订单/在册病例，状态机统一收敛到 ended
         self.session.pending_crisis = None
         self.session.expedition = None
         self.session.trade_order = None
+        self.session.medical = None
         alive = [r for r in self.session.residents if r.alive]
         # 计分：幸存者 * 天数 * 士气系数
         morale = self.avg_morale()
@@ -1730,7 +2181,17 @@ class BunkerEngine:
 
 
 RESOURCE_ZH = {"food": "食物", "water": "水源", "power": "电力", "oxygen": "氧气"}
-FACILITY_ZH = {"farm": "穹顶菜园", "water": "净水器", "power": "发电机", "oxygen": "水培制氧", "med": "医疗舱", "storage": "仓储区"}
+FACILITY_ZH = {"farm": "穹顶菜园", "water": "净水器", "power": "发电机", "oxygen": "水培制氧", "med": "医疗舱", "clinic": "医疗救治中心", "storage": "仓储区"}
+
+# 病例文案
+CASE_STAGE_ZH = {
+    CASE_REGISTERED: "已登记待收治",
+    CASE_TREATING: "住院治疗中",
+    CASE_ISOLATED: "隔离观察中",
+    CASE_RECOVERING: "恢复观察中",
+}
+CASE_TYPE_ZH = {"injury": "外伤", "disease": "疫病"}
+CASE_SEVERITY_ZH = {"mild": "轻症", "severe": "重症"}
 
 # 物资跨类别折算的相对价值：食物/水更稀缺昂贵，电力次之，氧气最便宜
 TRADE_VALUE = {FOOD: 1.2, WATER: 1.1, POWER: 0.9, OXY: 0.8}

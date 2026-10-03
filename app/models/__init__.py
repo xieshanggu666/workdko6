@@ -51,6 +51,10 @@ class GameSession(Base):
     # 作用与 last_expedition 相同：订单在动作完成后即被清除时，凭此仍能识别
     # 并发落败/连点的重复请求并安全回放
     last_trade = Column(JSON, nullable=True)
+    # 医疗救治中心快照：{"cases": {resident_id: {type,stage,severity,source,
+    # registered_day,progress,recover_days}}}。病例状态链 registered →
+    # treating/isolated → recovering → 出院（归档移除）；为 None 表示无在册病例
+    medical = Column(MutableDict.as_mutable(JSON), nullable=True)
     # 地堡对外信誉 0-100：影响外部聚落的审核通过率与交付成功率，随订单成败升降
     reputation = Column(Integer, nullable=False, default=50)
     outcome = Column(JSON, nullable=True)  # 结局详情

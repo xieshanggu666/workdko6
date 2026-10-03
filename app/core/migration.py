@@ -4,12 +4,13 @@
 项目没有引入 Alembic，这里用 ADD COLUMN 做前向兼容（对已是最新结构的库为幂等无操作）：
 - pending_crisis / last_resolution / last_expedition / expedition：状态机快照列，旧行补 NULL
 - trade_order / last_trade：贸易救援订单与幂等凭据列，旧行补 NULL
+- medical：医疗救治中心病例快照，旧行补 NULL（无在册病例）
 - reputation：对外信誉，旧行统一从初始值 50 开始
 - row_version：乐观锁版本号，旧行统一从 1 开始
 
 补列后再做一次“旧存档归一化”（reconcile_old_saves），保证历史行加载进新引擎后
 状态机可以唯一收敛：
-- 已结束档案上悬而未决的危机/探索队/贸易订单一律清除，统一收敛到 ended
+- 已结束档案上悬而未决的危机/探索队/贸易订单/在册病例一律清除，统一收敛到 ended
 - 损坏/悬空的快照（成员全部不在档、目标居民失踪、JSON 残缺）不阻塞每日推进
 - survivors 与实际存活居民数漂移时以居民表为准校正
 """
@@ -43,6 +44,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN trade_order JSON"))
         if "last_trade" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_trade JSON"))
+        if "medical" not in columns:
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN medical JSON"))
         if "reputation" not in columns:
             # NOT NULL + 常量默认值：旧档案从未开展贸易，信誉从初始值 50 开始
             conn.execute(
@@ -82,15 +85,16 @@ def reconcile_old_saves(engine):
     with engine.begin() as conn:
         rows = conn.execute(
             text(
-                "SELECT id, status, pending_crisis, expedition, trade_order, survivors "
+                "SELECT id, status, pending_crisis, expedition, trade_order, medical, survivors "
                 "FROM game_sessions"
             )
         ).all()
         updates = []
-        for sid, status, crisis_raw, exp_raw, trade_raw, survivors in rows:
+        for sid, status, crisis_raw, exp_raw, trade_raw, medical_raw, survivors in rows:
             old_crisis = _loads(crisis_raw)
             old_exp = _loads(exp_raw)
             old_trade = _loads(trade_raw)
+            old_medical = _loads(medical_raw)
             alive_count = None
             if {"id", "alive", "session_id"} <= resident_columns:
                 alive_count = conn.execute(
@@ -105,13 +109,15 @@ def reconcile_old_saves(engine):
                 new_crisis, crisis_changed = _clean_pending_crisis(conn, sid, old_crisis)
                 new_exp, exp_changed = _clean_expedition(old_exp, conn, sid)
                 new_trade, trade_changed = _clean_trade_order(old_trade, conn, sid)
+                new_medical, medical_changed = _clean_medical(old_medical, conn, sid)
             else:
-                # 已结束：危机/探索队/贸易订单快照一律清空，阶段统一收敛到 ended
+                # 已结束：危机/探索队/贸易订单/在册病例快照一律清空，阶段统一收敛到 ended
                 new_crisis, crisis_changed = None, old_crisis is not None
                 new_exp, exp_changed = None, old_exp is not None
                 new_trade, trade_changed = None, old_trade is not None
+                new_medical, medical_changed = None, old_medical is not None
 
-            if crisis_changed or exp_changed or trade_changed or (
+            if crisis_changed or exp_changed or trade_changed or medical_changed or (
                 alive_count is not None and alive_count != survivors
             ):
                 updates.append(
@@ -126,6 +132,9 @@ def reconcile_old_saves(engine):
                         "trade": json.dumps(new_trade, ensure_ascii=False)
                         if new_trade is not None
                         else None,
+                        "medical": json.dumps(new_medical, ensure_ascii=False)
+                        if new_medical is not None
+                        else None,
                         "survivors": alive_count if alive_count is not None else survivors,
                     }
                 )
@@ -134,7 +143,7 @@ def reconcile_old_saves(engine):
                 text(
                     "UPDATE game_sessions SET pending_crisis = :crisis, "
                     "expedition = :expedition, trade_order = :trade, "
-                    "survivors = :survivors WHERE id = :sid"
+                    "medical = :medical, survivors = :survivors WHERE id = :sid"
                 ),
                 u,
             )
@@ -255,4 +264,60 @@ def _clean_trade_order(order, conn, sid):
         if target_id is not None and target_id not in escorts:
             cleaned["pending_incident"] = None
             changed = True
+    return cleaned, changed
+
+
+# 病例合法阶段
+_CASE_STAGES = {"registered", "treating", "isolated", "recovering"}
+_CASE_TYPES = {"injury", "disease"}
+
+
+def _clean_medical(medical, conn, sid):
+    """医疗救治中心病例快照归一化。
+
+    - 结构残缺：无法识别病例字典，整列清空
+    - 病例绑定的居民不在档/已故：剔除该病例
+    - 病例阶段/类型非法：剔除该病例
+    - 无有效病例后：清空快照（统一以“无在册病例”开始）
+
+    返回 (归一化快照, 是否发生变化)。
+    """
+    if medical is None:
+        return None, False
+    if not isinstance(medical, dict) or not isinstance(medical.get("cases"), dict):
+        return None, True
+    known = _resident_ids(conn, sid)
+    # 已故居民编号（病例只跟随存活居民）
+    dead = {
+        row[0]
+        for row in conn.execute(
+            text("SELECT id FROM residents WHERE session_id = :sid AND alive = 0"),
+            {"sid": sid},
+        ).all()
+    }
+    raw_cases = medical["cases"]
+    cleaned_cases = {}
+    changed = False
+    for key, case in raw_cases.items():
+        try:
+            rid = int(key)
+        except (TypeError, ValueError):
+            changed = True
+            continue
+        if rid not in known or rid in dead:
+            changed = True
+            continue
+        if not isinstance(case, dict):
+            changed = True
+            continue
+        stage = case.get("stage")
+        ctype = case.get("type")
+        if stage not in _CASE_STAGES or ctype not in _CASE_TYPES:
+            changed = True
+            continue
+        cleaned_cases[key] = case
+    if not cleaned_cases:
+        return None, True
+    cleaned = dict(medical)
+    cleaned["cases"] = cleaned_cases
     return cleaned, changed

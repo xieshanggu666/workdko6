@@ -317,3 +317,111 @@ def test_trade_incident_with_dangling_target_is_dropped(db):
     order = db.get(GameSession, sid).trade_order
     assert order is not None
     assert order["pending_incident"] is None
+
+
+# ---- 医疗救治中心快照迁移 ----
+
+def _write_medical(sid, medical):
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE game_sessions SET medical = :m WHERE id = :sid"),
+            {"m": json.dumps(medical, ensure_ascii=False), "sid": sid},
+        )
+
+
+def test_backfills_medical_column(db):
+    """缺 medical 列的旧表经 ensure_schema 后补列，旧行为 NULL。"""
+    gs = make_session(db)
+    db.commit()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO gs_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, outcome JSON, "
+        "score INTEGER, created_at DATETIME, updated_at DATETIME, "
+        "pending_crisis JSON, last_resolution JSON, expedition JSON, "
+        "last_expedition JSON, trade_order JSON, last_trade JSON, "
+        "reputation INTEGER NOT NULL DEFAULT 50, row_version INTEGER NOT NULL DEFAULT 1)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions (id,name,day,target_day,status,resources,survivors,"
+        "outcome,score,created_at,updated_at,pending_crisis,last_resolution,expedition,"
+        "last_expedition,trade_order,last_trade,reputation,row_version) "
+        "SELECT id,name,day,target_day,status,resources,survivors,outcome,score,"
+        "created_at,updated_at,pending_crisis,last_resolution,expedition,"
+        "last_expedition,trade_order,last_trade,reputation,row_version FROM gs_old"
+    ))
+    db.execute(text("DROP TABLE gs_old"))
+    db.commit()
+
+    ensure_schema(engine)
+    db.expire_all()
+    assert db.query(GameSession).first().medical is None
+
+
+def test_medical_case_for_missing_resident_is_removed(db):
+    """病例绑定的居民已不在档：归一化剔除该病例，无有效病例则清空快照。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    _write_medical(sid, {"cases": {"999999": {
+        "type": "injury", "stage": "treating", "severity": "mild",
+        "source": "x", "progress": 10, "recover_days": 0,
+    }}})
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    assert db.get(GameSession, sid).medical is None
+
+
+def test_medical_case_for_dead_resident_is_removed(db):
+    """已故居民的在册病例：归一化剔除。"""
+    gs = make_session(db)
+    dead = gs.residents[0]
+    dead.alive = 0
+    db.commit()
+    sid = gs.id
+    _write_medical(sid, {"cases": {str(dead.id): {
+        "type": "disease", "stage": "isolated", "severity": "severe",
+        "source": "x", "progress": 10, "recover_days": 0,
+    }}})
+    reconcile_old_saves(engine)
+    db.expire_all()
+    assert db.get(GameSession, sid).medical is None
+
+
+def test_invalid_medical_stage_is_removed_but_valid_kept(db):
+    """非法阶段病例剔除，合法病例保留（快照不清空）。"""
+    gs = make_session(db)
+    valid = gs.residents[0].id
+    invalid = gs.residents[1].id
+    db.commit()
+    sid = gs.id
+    _write_medical(sid, {"cases": {
+        str(valid): {
+            "type": "injury", "stage": "treating", "severity": "mild",
+            "source": "x", "progress": 20, "recover_days": 0,
+        },
+        str(invalid): {
+            "type": "injury", "stage": "zombie", "severity": "mild",
+            "source": "x", "progress": 20, "recover_days": 0,
+        },
+    }})
+    reconcile_old_saves(engine)
+    db.expire_all()
+    medical = db.get(GameSession, sid).medical
+    assert set(medical["cases"].keys()) == {str(valid)}
+
+
+def test_ended_save_medical_cleared(db):
+    """已结束档案残留在册病例：归一化后清空。"""
+    gs = make_session(db)
+    gs.status = "over"
+    db.commit()
+    sid = gs.id
+    _write_medical(sid, {"cases": {str(gs.residents[0].id): {
+        "type": "injury", "stage": "treating", "severity": "mild",
+        "source": "x", "progress": 10, "recover_days": 0,
+    }}})
+    reconcile_old_saves(engine)
+    db.expire_all()
+    assert db.get(GameSession, sid).medical is None

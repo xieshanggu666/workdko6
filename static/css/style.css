@@ -215,3 +215,36 @@ select {
 .mo-flow { display: flex; align-items: center; gap: 12px; font-size: 13px; margin-bottom: 6px; flex-wrap: wrap; }
 .market-offer.rescue { border-left: 3px solid rgba(229,72,77,.6); }
 .market-offer.procure { border-left: 3px solid rgba(67,200,122,.6); }
+/* ---------- 医疗救治中心 ---------- */
+.med-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 6px 0 12px; }
+.med-summary .card .v { color: #4ec9e8; }
+.med-summary .card .v small { font-size: 12px; font-weight: 500; color: var(--dim); margin-left: 4px; }
+.med-cases { display: flex; flex-direction: column; gap: 10px; margin: 14px 0; }
+.med-case {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--bg-soft); border: 1px solid var(--line); border-left-width: 3px;
+  border-radius: 10px; padding: 10px 14px;
+}
+.med-case.registered { border-left-color: var(--warn); }
+.med-case.treating { border-left-color: #4ec9e8; }
+.med-case.isolated { border-left-color: #b07cf0; }
+.med-case.recovering { border-left-color: var(--primary); }
+.mc-info { flex: 1; min-width: 0; }
+.mc-name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 3px; }
+.mc-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.med-fill { background: linear-gradient(90deg, #4ec9e8, #67e8c9); }
+.chip.case-tag { margin-left: 6px; font-size: 11px; }
+.chip.case-tag.registered { color: var(--warn); border-color: rgba(255,179,0,.45); }
+.chip.case-tag.treating { color: #4ec9e8; border-color: rgba(78,201,232,.45); }
+.chip.case-tag.isolated { color: #b07cf0; border-color: rgba(176,124,240,.45); }
+.chip.case-tag.recovering { color: var(--primary); border-color: rgba(67,200,122,.5); }
+.chip.disease { color: #b07cf0; border-color: rgba(176,124,240,.45); }
+.chip.injury { color: var(--danger); border-color: rgba(229,72,77,.45); }
+.chip.severe { color: var(--warn); border-color: rgba(255,179,0,.45); }
+.chip.mild { color: var(--dim); }
+.chip.stage { color: #4ec9e8; border-color: rgba(78,201,232,.4); }
+.med-register { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
+.med-register h3 { margin: 0 0 4px; font-size: 15px; }
+.exp-member.disabled { opacity: .45; cursor: default; }
+.exp-member.disabled:hover { border-color: var(--line); }
+.exp-member .btn.tiny { margin-left: 4px; padding: 2px 8px; font-size: 11px; }

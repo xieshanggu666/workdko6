@@ -20,5 +20,5 @@ const Api = {
 };
 
 const zhResource = { food: "食物", water: "水源", power: "电力", oxygen: "氧气" };
-const zhJob = { engineer: "工程师", farmer: "农民", general: "杂工" };
+const zhJob = { engineer: "工程师", farmer: "农民", general: "杂工", medic: "医护" };
 const zhStatus = { running: "进行中", win: "胜利", over: "失败" };

@@ -15,6 +15,10 @@ from ..services.engine import (
     FACILITY_COST,
     FACILITY_ZH,
     JOB_EFFICIENCY,
+    CASE_REGISTERED,
+    CASE_TREATING,
+    CASE_ISOLATED,
+    CASE_RECOVERING,
 )
 from ..schemas import (
     SessionCreate,
@@ -29,6 +33,8 @@ from ..schemas import (
     TradeIncidentChoice,
     TradeCancel,
     JobAssign,
+    MedicalRegister,
+    MedicalInfo,
     BuildRequest,
     BuildableInfo,
     EngineConfig,
@@ -100,7 +106,7 @@ def get_session(sid: int, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
-def _serialize_resident(r, away_ids=None, trade_status=None):
+def _serialize_resident(r, away_ids=None, trade_status=None, case_stage=None):
     return {
         "id": r.id,
         "name": r.name,
@@ -112,7 +118,49 @@ def _serialize_resident(r, away_ids=None, trade_status=None):
         "away": 1 if (away_ids and r.id in away_ids) else 0,
         # 贸易订单角色：transporting=在途押运（按离堡结算）；reviewing=待出发押运（仍在堡）
         "trade_status": trade_status,
+        # 在册病例阶段：住院治疗/隔离/恢复等，None 表示无病例
+        "case_stage": case_stage,
         "joined_day": r.joined_day,
+    }
+
+
+def _medical_payload(gs, db):
+    """组装医疗救治中心快照：病例明细（附居民姓名）+ 容量统计，供前端直接渲染。"""
+    if not isinstance(gs.medical, dict) or not gs.medical.get("cases"):
+        return None
+    eng = BunkerEngine(db, gs)
+    cases_out = {}
+    stage_count = {
+        CASE_REGISTERED: 0, CASE_TREATING: 0,
+        CASE_ISOLATED: 0, CASE_RECOVERING: 0,
+    }
+    for key, case in gs.medical.get("cases", {}).items():
+        r = next((x for x in gs.residents if str(x.id) == str(key)), None)
+        if not r or not r.alive:
+            continue
+        cases_out[str(r.id)] = {
+            "resident_id": r.id,
+            "resident_name": r.name,
+            "type": case.get("type"),
+            "stage": case.get("stage"),
+            "severity": case.get("severity"),
+            "source": case.get("source"),
+            "registered_day": case.get("registered_day"),
+            "progress": case.get("progress", 0.0),
+            "recover_days": case.get("recover_days", 0),
+        }
+        stage = case.get("stage")
+        if stage in stage_count:
+            stage_count[stage] += 1
+    return {
+        "cases": cases_out,
+        "capacity": eng.treatment_capacity(),
+        "treating": stage_count[CASE_TREATING],
+        "registered": stage_count[CASE_REGISTERED],
+        "isolated": stage_count[CASE_ISOLATED],
+        "recovering": stage_count[CASE_RECOVERING],
+        "medic_count": eng.job_count("medic"),
+        "has_clinic": eng._clinic() is not None,
     }
 
 
@@ -131,8 +179,16 @@ def get_session_detail(gs, db):
         elif order.get("status") == "reviewing":
             for mid in order.get("escorts", []):
                 trade_tag[mid] = "reviewing"
+    # 在册病例阶段（registered/treating/isolated/recovering），前端据此渲染病例状态
+    case_tag = {}
+    if isinstance(gs.medical, dict) and isinstance(gs.medical.get("cases"), dict):
+        for key, case in gs.medical["cases"].items():
+            try:
+                case_tag[int(key)] = case.get("stage")
+            except (TypeError, ValueError):
+                continue
     residents = [
-        _serialize_resident(r, away_ids, trade_tag.get(r.id))
+        _serialize_resident(r, away_ids, trade_tag.get(r.id), case_tag.get(r.id))
         for r in gs.residents
     ]
     facilities = [
@@ -170,6 +226,7 @@ def get_session_detail(gs, db):
         pending_crisis=gs.pending_crisis,
         expedition=gs.expedition,
         trade_order=gs.trade_order,
+        medical=_medical_payload(gs, db),
         reputation=gs.reputation if gs.reputation is not None else 50,
         residents=residents,
         facilities=facilities,
@@ -449,6 +506,60 @@ def set_job(sid: int, rid: int, body: JobAssign, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
+# ---- 医疗救治中心 ----
+@router.get("/sessions/{sid}/medical", response_model=MedicalInfo)
+def medical_status(sid: int, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    eng = BunkerEngine(db, gs)
+    payload = _medical_payload(gs, db)
+    if payload is None:
+        payload = {
+            "cases": {}, "capacity": eng.treatment_capacity(),
+            "treating": 0, "registered": 0, "isolated": 0, "recovering": 0,
+            "medic_count": eng.job_count("medic"),
+            "has_clinic": eng._clinic() is not None,
+        }
+    return MedicalInfo(**{k: v for k, v in payload.items() if k != "cases"})
+
+
+@router.post("/sessions/{sid}/resident/{rid}/medical/register", response_model=SessionDetail)
+def medical_register(sid: int, rid: int, body: MedicalRegister, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(db, gs, lambda eng: eng.medical_register(rid, body.case_type))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/resident/{rid}/medical/treat", response_model=SessionDetail)
+def medical_treat(sid: int, rid: int, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(db, gs, lambda eng: eng.medical_treat(rid))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/resident/{rid}/medical/isolate", response_model=SessionDetail)
+def medical_isolate(sid: int, rid: int, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(db, gs, lambda eng: eng.medical_isolate(rid))
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/resident/{rid}/medical/discharge", response_model=SessionDetail)
+def medical_discharge(sid: int, rid: int, db: Session = Depends(get_db)):
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(db, gs, lambda eng: eng.medical_discharge(rid))
+    return get_session_detail(gs, db)
+
+
 @router.delete("/sessions/{sid}", response_model=Message)
 def delete_session(sid: int, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
@@ -480,8 +591,8 @@ def list_buildable():
             cost=FACILITY_COST[1],
             level_scale=1.6,
         )
-        for k in ("farm", "water", "power", "oxygen", "med", "storage")
+        for k in ("farm", "water", "power", "oxygen", "med", "clinic", "storage")
     ]
 
 
-JOB_ZH = {"engineer": "工程师", "farmer": "农民", "general": "杂工"}
+JOB_ZH = {"engineer": "工程师", "farmer": "农民", "general": "杂工", "medic": "医护"}

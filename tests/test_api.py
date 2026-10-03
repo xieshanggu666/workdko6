@@ -494,3 +494,139 @@ def test_trade_concurrent_incident_loser_replays_200(client, monkeypatch):
     body = r.json()
     assert body["trade_order"] is None
     assert body["reputation"] == 42
+
+
+# ---- 医疗救治中心 HTTP 端到端 ----
+
+def test_medical_full_flow_http(client):
+    """登记 → 收治 → 推进治疗 → 恢复 → 自动出院 的完整 HTTP 链路。"""
+    r = client.post("/api/sessions", json={"name": "medflow"})
+    sid = r.json()["id"]
+    rid = r.json()["residents"][0]["id"]
+
+    # 建造医疗救治中心（Lv.1 = 3 床位），获得充足容量
+    r = client.post(f"/api/sessions/{sid}/build", json={"category": "clinic"})
+    assert r.status_code == 200
+
+    # 直接把健康压低到阈值以下，手动登记外伤
+    db = SessionLocal()
+    try:
+        gs = db.get(GameSession, sid)
+        gs.residents[0].health = 55
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post(f"/api/sessions/{sid}/resident/{rid}/medical/register",
+                    json={"case_type": "injury"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["medical"] is not None
+    case = body["medical"]["cases"][str(rid)]
+    assert case["stage"] == "registered"
+    # 居民序列化带出 case_stage
+    resident = next(x for x in body["residents"] if x["id"] == rid)
+    assert resident["case_stage"] == "registered"
+
+    # 收治住院
+    r = client.post(f"/api/sessions/{sid}/resident/{rid}/medical/treat")
+    assert r.status_code == 200
+    assert r.json()["medical"]["cases"][str(rid)]["stage"] == "treating"
+
+    # 推进一天：治疗病例消耗物资，疗程推进
+    before = client.get(f"/api/sessions/{sid}").json()
+    before_power = before["resources"]["power"]
+    r = client.post(f"/api/sessions/{sid}/advance")
+    assert r.status_code == 200
+    body = r.json()["session"]
+    # 救治中心持续耗电 + 治疗病例电力医护消耗（发电机产出不足以掩盖双重耗电）
+    assert body["resources"]["power"] < before_power
+    # 疗程进度推进
+    assert body["medical"]["cases"][str(rid)]["progress"] > 0
+
+
+def test_medical_status_endpoint(client):
+    """GET /medical 返回容量与病例统计。"""
+    r = client.post("/api/sessions", json={"name": "medstat"})
+    sid = r.json()["id"]
+    r = client.get(f"/api/sessions/{sid}/medical")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["treating"] == 0
+    # 新档案无救治中心、无医护：容量 0
+    assert body["capacity"] == 0
+    assert body["has_clinic"] is False
+
+
+def test_manual_register_rejected_when_healthy_http(client):
+    """健康居民登记病例 → 400。"""
+    r = client.post("/api/sessions", json={"name": "healthy"})
+    sid = r.json()["id"]
+    rid = r.json()["residents"][0]["id"]  # health 90
+    r = client.post(f"/api/sessions/{sid}/resident/{rid}/medical/register",
+                    json={"case_type": "injury"})
+    assert r.status_code == 400
+
+
+def test_sick_quarantine_creates_case_http(client, monkeypatch):
+    """疫病·隔离治疗结算后：目标居民病例进入隔离（HTTP 联动）。"""
+    from app.services import engine as engine_mod
+
+    class Scripted:
+        def random(self):
+            return 0.1  # 必触发危机
+
+        def choice(self, seq_):
+            return seq_[0]
+
+    monkeypatch.setattr(engine_mod, "_rng", lambda: Scripted())
+
+    r = client.post("/api/sessions", json={"name": "sickcase"})
+    sid = r.json()["id"]
+    # CRISIS_POOL 第一项是 radstorm，不是 sick：直接在引擎里挂起疫病危机
+    db = SessionLocal()
+    try:
+        gs = db.get(GameSession, sid)
+        from app.services.engine import BunkerEngine as BE, CRISIS_POOL
+        eng = BE(db, gs)
+        event = next(e for e in CRISIS_POOL if e["key"] == "sick")
+        crisis = eng._build_crisis(event)
+        gs.pending_crisis = crisis
+        target_id = crisis["target_id"]
+        token = crisis["token"]
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post(f"/api/sessions/{sid}/resolve", json={
+        "event_key": "sick", "choice_key": "quarantine",
+        "target_id": target_id, "token": token,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["medical"] is not None
+    case = body["medical"]["cases"][str(target_id)]
+    assert case["type"] == "disease"
+    assert case["stage"] == "isolated"
+
+
+def test_clinic_buildable_via_buildings_list(client):
+    """/buildings 下发列表包含医疗救治中心。"""
+    r = client.post("/api/sessions", json={"name": "b"})
+    buildings = client.get("/api/buildings").json()
+    cats = {b["category"] for b in buildings}
+    assert "clinic" in cats
+
+
+def test_medic_job_assignable_http(client):
+    """居民岗位可调整为医护（/config 与调岗接口均支持）。"""
+    cfg = client.get("/api/config").json()
+    assert "medic" in cfg["job_options"]
+    r = client.post("/api/sessions", json={"name": "medicjob"})
+    sid = r.json()["id"]
+    rid = r.json()["residents"][0]["id"]
+    r = client.post(f"/api/sessions/{sid}/resident/{rid}/job", json={"job": "medic"})
+    assert r.status_code == 200
+    assert next(x for x in r.json()["residents"] if x["id"] == rid)["job"] == "medic"
+    # 有医护后野战容量 = 1
+    assert client.get(f"/api/sessions/{sid}/medical").json()["capacity"] == 1
