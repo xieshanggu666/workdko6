@@ -20,6 +20,8 @@ window.GameView = {
       showTradeDialog: false,
       tradeOffer: null,
       tradeEscorts: [],
+      // 医疗救治中心
+      medRegistering: {},
     };
   },
   created() { this.init(); },
@@ -250,6 +252,48 @@ window.GameView = {
         `${{food:'食物',water:'水源',power:'电力',oxygen:'氧气'}[k] || k} ${Math.round(v)}`
       ).join("、");
     },
+    // ---- 医疗救治中心 ----
+    medCaseOf(rid) {
+      const cases = (this.s && this.s.medical_cases) || [];
+      return cases.find(c => c.resident_id === rid &&
+        ["registered", "treating", "isolated"].includes(c.status)) || null;
+    },
+    caseStatusZh(st) {
+      return { registered: "待收治", treating: "治疗中", isolated: "隔离中",
+               recovered: "已康复", deceased: "已病亡" }[st] || st;
+    },
+    medCaseTitle(c) {
+      if (!c) return "";
+      const base = (c.infectious ? "传染病例" : (c.kind || "伤病病例"));
+      return `${base} · ${this.caseStatusZh(c.status)}`;
+    },
+    async registerCase(rid, infectious) {
+      this.error = "";
+      if (this.actionLocked) return;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/medical/register/${rid}`, { infectious });
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+    },
+    async admitCase(rid, mode) {
+      this.error = "";
+      if (this.actionLocked) return;
+      try {
+        this.s = await Api.post(`/api/sessions/${this.sid}/medical/admit/${rid}`, { mode });
+      } catch (e) { this.error = e.message; await this.loadSessionOn409(e); }
+    },
+    medActiveCases() {
+      const cases = (this.s && this.s.medical_cases) || [];
+      return cases.filter(c => ["registered", "treating", "isolated"].includes(c.status));
+    },
+    medHistoryCases() {
+      const cases = (this.s && this.s.medical_cases) || [];
+      return cases.filter(c => ["recovered", "deceased"].includes(c.status))
+        .slice(-12).reverse();
+    },
+    canRegister(r) {
+      // 在堡、存活、无活跃病例且健康低于 70 才可登记
+      return r.alive && !r.away && !this.medCaseOf(r.id) && r.health < 70;
+    },
     resPct(k) {
       const cap = { food: 300, water: 300, power: 200, oxygen: 200 };
       const c = cap[k] || 100;
@@ -290,6 +334,17 @@ window.GameView = {
       const ids = this.s.expedition.members || [];
       return ids.filter(id => this.s.residents.some(r => r.id === id)).length;
     },
+    medActiveCount() {
+      return this.medActiveCases().length;
+    },
+    medCareCostText() {
+      // 治疗床位/隔离床位的每日人均消耗（与引擎 MED_CARE_COST 同口径）
+      const zh = { food: "食物", water: "水源", power: "电力" };
+      const treating = { food: 0.6, water: 0.5, power: 0.8 };
+      const isolated = { food: 0.8, water: 0.7, power: 1.2 };
+      const fmt = bag => Object.entries(bag).map(([k, v]) => `${zh[k]} ${v}`).join("、");
+      return { treating: fmt(treating), isolated: fmt(isolated) };
+    },
   },
   template: `
   <div v-if="s" class="game" :class="clazz(s.status)">
@@ -324,6 +379,7 @@ window.GameView = {
         <button :class="{ active: tab==='residents' }" @click="tab='residents'">幸存者 ({{ alive.length }})</button>
         <button :class="{ active: tab==='expedition' }" @click="tab='expedition'">探索队<template v-if="s.expedition"> ({{ expMemberCount }})</template></button>
         <button :class="{ active: tab==='trade' }" @click="tab='trade'">贸易救援<template v-if="s.trade_order"> ●</template></button>
+        <button :class="{ active: tab==='medical' }" @click="tab='medical'">医疗救治<template v-if="medActiveCount"> ({{ medActiveCount }})</template></button>
         <button :class="{ active: tab==='build' }" @click="tab='build'">设施扩建</button>
         <button :class="{ active: tab==='log' }" @click="tab='log'">大事记</button>
       </nav>
@@ -332,15 +388,15 @@ window.GameView = {
       <div v-if="tab==='overview'">
         <div class="cards">
           <div class="card"><div class="k">幸存者</div><div class="v">{{ s.survivors }}</div><div class="hint">人口即火种</div></div>
+          <div class="card"><div class="k">平均健康</div><div class="v">{{ s.residents.length ? fmt(alive.reduce((a,r)=>a+r.health,0)/alive.length) : 0 }}</div><div class="hint">救治中心维系</div></div>
           <div class="card"><div class="k">士气</div><div class="v">{{ s.residents.length ? fmt(alive.reduce((a,r)=>a+r.morale,0)/alive.length) : 0 }}</div><div class="hint">影响产出效率</div></div>
-          <div class="card"><div class="k">设施</div><div class="v">{{ s.facilities.length }}</div><div class="hint">支撑循环</div></div>
           <div class="card"><div class="k">得分</div><div class="v">{{ s.score }}</div><div class="hint">生存评分</div></div>
         </div>
         <div class="fac-grid">
           <div v-for="f in s.facilities" :key="f.id" class="fac">
             <span class="fac-name">{{ f.name }}</span>
             <span class="chip">Lv.{{ f.level }}</span>
-            <span class="dim">{{ {farm:'产食物',water:'产水源',power:'发电',oxygen:'产氧',med:'医疗',storage:'仓储'}[f.category] }}</span>
+            <span class="dim">{{ {farm:'产食物',water:'产水源',power:'发电',oxygen:'产氧',med:'医疗',clinic:'救治中心',storage:'仓储'}[f.category] }}</span>
             <button v-if="s.status==='running'" class="btn tiny" :disabled="actionLocked" @click="upgrade(f.id)">升级</button>
           </div>
         </div>
@@ -351,16 +407,24 @@ window.GameView = {
         <div v-for="r in s.residents" :key="r.id" class="person" :class="{ dead: !r.alive, away: r.away }">
           <div class="p-avatar">{{ r.name[0] }}</div>
           <div class="p-info">
-            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span><span v-if="r.away" class="chip away-tag">{{ r.trade_status === 'transporting' ? '押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span></div>
+            <div class="p-name">{{ r.name }} <span class="dim">{{ r.job_zh }}</span>
+              <span v-if="r.case_status" class="chip med-tag" :class="r.case_status">
+                {{ r.case_infectious ? '疫' : '病' }}·{{ caseStatusZh(r.case_status) }}
+              </span>
+              <span v-if="r.away" class="chip away-tag">{{ r.trade_status === 'transporting' ? '押运中' : '探索中' }}</span><span v-if="r.trade_status==='reviewing'" class="chip review-tag">待押运</span>
+            </div>
             <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
             <div class="meter"><i>士气</i><span class="track"><span class="fill" :style="{width: r.morale+'%', background:'#ffb300'}"></span></span><b>{{ fmt(r.morale) }}</b></div>
           </div>
           <div class="p-actions" v-if="r.alive && s.status==='running'">
-            <select :value="r.job" :disabled="actionLocked || r.away" @change="assignJob(r.id, $event.target.value)">
+            <select :value="r.job" :disabled="actionLocked || r.away || !!r.case_status" @change="assignJob(r.id, $event.target.value)">
               <option value="engineer">工程师</option>
               <option value="farmer">农民</option>
+              <option value="medic">医护</option>
               <option value="general">杂工</option>
             </select>
+            <button v-if="s.medical_summary && s.medical_summary.has_clinic && !r.away && !r.case_status && r.health < 70"
+                    class="btn tiny" :disabled="actionLocked" @click="tab='medical'">登记病例</button>
           </div>
         </div>
       </div>
@@ -438,6 +502,91 @@ window.GameView = {
         </div>
       </div>
 
+      <!-- 医疗救治中心 -->
+      <div v-if="tab==='medical'">
+        <div class="exp-panel">
+          <!-- 未建造救治中心 -->
+          <div v-if="!s.medical_summary || !s.medical_summary.has_clinic" class="exp-empty">
+            <p>建造「医疗救治中心」后，受伤与染疫的居民可经历 <b>登记 → 治疗/隔离 → 康复</b> 的完整救治流程。</p>
+            <p class="dim">救治床位按中心等级提供，指派「医护」岗位可增加床位与救治效率；治疗/隔离每日消耗食物、水源与电力，未隔离的传染病例可能在堡内扩散。</p>
+            <button class="btn primary" :disabled="s.status!=='running' || actionLocked"
+                    @click="s && (tab='build')">前往设施扩建</button>
+          </div>
+          <!-- 救治中心面板 -->
+          <div v-else>
+            <div class="med-head">
+              <span class="chip">医疗救治中心 Lv.{{ s.medical_summary.clinic_level }}</span>
+              <span class="chip">当值医护 {{ s.medical_summary.medics }}</span>
+              <span class="chip">床位 {{ s.medical_summary.beds_used }} / {{ s.medical_summary.bed_capacity }}</span>
+              <span class="chip registered">待收治 {{ s.medical_summary.registered }}</span>
+              <span class="chip reviewing">隔离中 {{ s.medical_summary.isolated }}</span>
+            </div>
+            <p class="dim" v-if="s.medical_summary.frozen_away" style="color:var(--info)">
+              {{ s.medical_summary.frozen_away }} 名病例随探索/押运队伍离堡，病例冻结，回堡后续治。
+            </p>
+
+            <!-- 活跃病例 -->
+            <h3 class="med-h3" v-if="medActiveCases().length">在档病例（{{ medActiveCases().length }}）</h3>
+            <div class="med-cases">
+              <div v-for="c in medActiveCases()" :key="c.id" class="med-case" :class="c.status">
+                <template v-for="r in s.residents" :key="r.id">
+                  <div v-if="r.id === c.resident_id" class="med-case-inner">
+                    <span class="p-avatar">{{ r.name[0] }}</span>
+                    <div class="mc-info">
+                      <div class="mc-name">
+                        {{ r.name }}
+                        <span class="chip" :class="c.status">{{ medCaseTitle(c) }}</span>
+                        <span v-if="r.away" class="chip away-tag">离堡冻结</span>
+                      </div>
+                      <div class="meter"><i>健康</i><span class="track"><span class="fill" :style="{width: r.health+'%', background:'#4caf50'}"></span></span><b>{{ fmt(r.health) }}</b></div>
+                      <div class="dim">{{ c.reason }} · 第 {{ c.open_day }} 天登记<span v-if="c.days_cared"> · 已救治 {{ c.days_cared }} 床日</span></div>
+                    </div>
+                    <div class="mc-actions" v-if="s.status==='running' && !r.away">
+                      <button class="btn tiny primary" :disabled="actionLocked"
+                              @click="admitCase(r.id, 'treating')">
+                        {{ c.status === 'treating' ? '治疗中' : '转入治疗' }}
+                      </button>
+                      <button class="btn tiny danger" :disabled="actionLocked"
+                              @click="admitCase(r.id, 'isolated')">
+                        {{ c.status === 'isolated' ? '隔离中' : '转入隔离' }}
+                      </button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- 可登记的在堡居民 -->
+            <h3 class="med-h3">健康巡查</h3>
+            <p class="dim">治疗每日人均消耗 {{ medCareCostText.treating }}；隔离每日人均消耗 {{ medCareCostText.isolated }}（隔离可阻断疫病扩散）。健康低于 70 可手动登记，低于 35 每日巡检自动建档。</p>
+            <div class="med-watch">
+              <div v-for="r in inBunkerAlive.filter(x => canRegister(x))" :key="r.id" class="med-watch-item">
+                <span class="p-avatar">{{ r.name[0] }}</span>
+                <span>{{ r.name }}</span>
+                <span class="dim">{{ r.job_zh }} · 健康 {{ fmt(r.health) }}</span>
+                <button class="btn tiny" :disabled="actionLocked"
+                        @click="registerCase(r.id, false)">登记伤病</button>
+                <button class="btn tiny danger" :disabled="actionLocked"
+                        @click="registerCase(r.id, true)">登记疫病</button>
+              </div>
+              <div v-if="!inBunkerAlive.some(x => canRegister(x))" class="dim">在堡居民健康状况良好，暂无需登记。</div>
+            </div>
+
+            <!-- 救治履历 -->
+            <h3 class="med-h3" v-if="medHistoryCases().length">救治履历（最近 {{ medHistoryCases().length }} 例）</h3>
+            <div class="med-history" v-if="medHistoryCases().length">
+              <div v-for="c in medHistoryCases()" :key="c.id" class="med-hist-item" :class="c.status">
+                <span class="chip" :class="c.status">{{ caseStatusZh(c.status) }}</span>
+                <b>{{ c.resident_name }}</b>
+                <span class="dim">{{ c.infectious ? '疫病' : (c.kind || '伤病') }} · {{ c.reason }}
+                  · 第 {{ c.open_day }} 天登记<template v-if="c.close_day"> / 第 {{ c.close_day }} 天结案</template>
+                  <template v-if="c.days_cared"> · 救治 {{ c.days_cared }} 床日</template></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 扩建 -->
       <div v-if="tab==='build'">
         <div class="build-grid">
@@ -467,7 +616,12 @@ window.GameView = {
         <div class="end-stats">
           <div><span>存活天数</span><b>{{ s.outcome.day }}</b></div>
           <div><span>幸存者</span><b>{{ s.outcome.survivors }}</b></div>
+          <div><span>平均健康</span><b>{{ s.outcome.avg_health == null ? '-' : s.outcome.avg_health }}</b></div>
           <div><span>得分</span><b>{{ s.score }}</b></div>
+        </div>
+        <div v-if="s.outcome.medical && s.outcome.medical.total" class="med-end">
+          医疗救治：登记 {{ s.outcome.medical.total }} 例 · 康复 {{ s.outcome.medical.recovered }} 人 ·
+          病亡 {{ s.outcome.medical.deceased }} 人 · 累计 {{ s.outcome.medical.care_days }} 床日
         </div>
         <button class="btn primary" @click="onExit">返回档案列表</button>
       </div>

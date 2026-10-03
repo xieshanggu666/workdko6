@@ -494,3 +494,98 @@ def test_trade_concurrent_incident_loser_replays_200(client, monkeypatch):
     body = r.json()
     assert body["trade_order"] is None
     assert body["reputation"] == 42
+
+
+# ---- 医疗救治中心 HTTP 端到端 ----
+
+def test_medical_register_and_admit_flow(client):
+    """建中心 → 登记病例 → 收治治疗，序列化字段随档案正确下发。"""
+    r = client.post("/api/sessions", json={"name": "med-e2e"})
+    sid = r.json()["id"]
+    residents = r.json()["residents"]
+    rid = residents[0]["id"]
+
+    # 未建中心：登记 400
+    db = SessionLocal()
+    try:
+        gs = db.get(GameSession, sid)
+        gs.residents[0].health = 40
+        db.commit()
+    finally:
+        db.close()
+    r = client.post(f"/api/sessions/{sid}/medical/register/{rid}", json={"infectious": True})
+    assert r.status_code == 400
+
+    # 建造医疗救治中心
+    r = client.post(f"/api/sessions/{sid}/build", json={"category": "clinic"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["medical_summary"]["has_clinic"] is True
+    assert body["medical_summary"]["bed_capacity"] == 2
+
+    # 登记传染病例
+    r = client.post(f"/api/sessions/{sid}/medical/register/{rid}", json={"infectious": True})
+    assert r.status_code == 200
+    body = r.json()
+    me = next(x for x in body["residents"] if x["id"] == rid)
+    assert me["case_status"] == "registered"
+    assert me["case_infectious"] == 1
+    assert body["medical_summary"]["registered"] == 1
+    assert len(body["medical_cases"]) == 1
+
+    # 重复登记：400
+    r = client.post(f"/api/sessions/{sid}/medical/register/{rid}", json={"infectious": False})
+    assert r.status_code == 400
+
+    # 收治隔离
+    r = client.post(f"/api/sessions/{sid}/medical/admit/{rid}", json={"mode": "isolated"})
+    assert r.status_code == 200
+    body = r.json()
+    me = next(x for x in body["residents"] if x["id"] == rid)
+    assert me["case_status"] == "isolated"
+    assert body["medical_summary"]["isolated"] == 1
+    assert body["medical_summary"]["beds_used"] == 1
+
+    # 非法收治方式：422（Pydantic 只校验字符串，引擎校验模式）→ 400
+    r = client.post(f"/api/sessions/{sid}/medical/admit/{rid}", json={"mode": "freezer"})
+    assert r.status_code == 400
+
+
+def test_medical_register_requires_low_health(client):
+    """健康良好的居民登记病例：400。"""
+    r = client.post("/api/sessions", json={"name": "med-health"})
+    sid = r.json()["id"]
+    rid = r.json()["residents"][0]["id"]
+    client.post(f"/api/sessions/{sid}/build", json={"category": "clinic"})
+    r = client.post(f"/api/sessions/{sid}/medical/register/{rid}", json={"infectious": False})
+    assert r.status_code == 400
+
+
+def test_medical_blocked_when_crisis_pending(client):
+    """危机待处理时登记/收治：400。"""
+    def setup(db, gs, eng):
+        gs.pending_crisis = {"token": "t", "event": "mutiny", "choices": []}
+    (sid,) = _seed(setup)
+    rid = client.get(f"/api/sessions/{sid}").json()["residents"][0]["id"]
+    r = client.post(f"/api/sessions/{sid}/medical/register/{rid}", json={"infectious": False})
+    assert r.status_code == 400
+
+
+def test_medic_job_assignable_via_api(client):
+    """医护岗位可通过调岗接口下发。"""
+    r = client.post("/api/sessions", json={"name": "medic-job"})
+    sid = r.json()["id"]
+    rid = r.json()["residents"][0]["id"]
+    r = client.post(f"/api/sessions/{sid}/resident/{rid}/job", json={"job": "medic"})
+    assert r.status_code == 200
+    me = next(x for x in r.json()["residents"] if x["id"] == rid)
+    assert me["job"] == "medic"
+    assert me["job_zh"] == "医护"
+
+
+def test_clinic_in_buildings_and_endpoint(client):
+    """可建造列表含医疗救治中心。"""
+    rows = client.get("/api/buildings").json()
+    cats = {b["category"]: b for b in rows}
+    assert "clinic" in cats
+    assert cats["clinic"]["name"] == "医疗救治中心"

@@ -4,6 +4,7 @@
 项目没有引入 Alembic，这里用 ADD COLUMN 做前向兼容（对已是最新结构的库为幂等无操作）：
 - pending_crisis / last_resolution / last_expedition / expedition：状态机快照列，旧行补 NULL
 - trade_order / last_trade：贸易救援订单与幂等凭据列，旧行补 NULL
+- medical_cases：医疗救治中心病例簿列，旧行补 NULL
 - reputation：对外信誉，旧行统一从初始值 50 开始
 - row_version：乐观锁版本号，旧行统一从 1 开始
 
@@ -11,6 +12,7 @@
 状态机可以唯一收敛：
 - 已结束档案上悬而未决的危机/探索队/贸易订单一律清除，统一收敛到 ended
 - 损坏/悬空的快照（成员全部不在档、目标居民失踪、JSON 残缺）不阻塞每日推进
+- 病例簿中结构残缺或居民已不在档的活跃病例收敛/剔除，终态履历同步校正
 - survivors 与实际存活居民数漂移时以居民表为准校正
 """
 import json
@@ -43,6 +45,9 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN trade_order JSON"))
         if "last_trade" not in columns:
             conn.execute(text("ALTER TABLE game_sessions ADD COLUMN last_trade JSON"))
+        if "medical_cases" not in columns:
+            # 医疗救治中心病例簿：旧档案从未开展救治，从空病历开始
+            conn.execute(text("ALTER TABLE game_sessions ADD COLUMN medical_cases JSON"))
         if "reputation" not in columns:
             # NOT NULL + 常量默认值：旧档案从未开展贸易，信誉从初始值 50 开始
             conn.execute(
@@ -82,15 +87,17 @@ def reconcile_old_saves(engine):
     with engine.begin() as conn:
         rows = conn.execute(
             text(
-                "SELECT id, status, pending_crisis, expedition, trade_order, survivors "
+                "SELECT id, status, pending_crisis, expedition, trade_order, "
+                "medical_cases, survivors "
                 "FROM game_sessions"
             )
         ).all()
         updates = []
-        for sid, status, crisis_raw, exp_raw, trade_raw, survivors in rows:
+        for sid, status, crisis_raw, exp_raw, trade_raw, med_raw, survivors in rows:
             old_crisis = _loads(crisis_raw)
             old_exp = _loads(exp_raw)
             old_trade = _loads(trade_raw)
+            old_med = _loads(med_raw)
             alive_count = None
             if {"id", "alive", "session_id"} <= resident_columns:
                 alive_count = conn.execute(
@@ -110,8 +117,10 @@ def reconcile_old_saves(engine):
                 new_crisis, crisis_changed = None, old_crisis is not None
                 new_exp, exp_changed = None, old_exp is not None
                 new_trade, trade_changed = None, old_trade is not None
+            # 病例簿归一化与档案阶段无关：活跃病例绑定的居民必须仍在档且状态一致
+            new_med, med_changed = _clean_medical_cases(old_med, conn, sid)
 
-            if crisis_changed or exp_changed or trade_changed or (
+            if crisis_changed or exp_changed or trade_changed or med_changed or (
                 alive_count is not None and alive_count != survivors
             ):
                 updates.append(
@@ -126,6 +135,9 @@ def reconcile_old_saves(engine):
                         "trade": json.dumps(new_trade, ensure_ascii=False)
                         if new_trade is not None
                         else None,
+                        "medical": json.dumps(new_med, ensure_ascii=False)
+                        if new_med is not None
+                        else None,
                         "survivors": alive_count if alive_count is not None else survivors,
                     }
                 )
@@ -134,6 +146,7 @@ def reconcile_old_saves(engine):
                 text(
                     "UPDATE game_sessions SET pending_crisis = :crisis, "
                     "expedition = :expedition, trade_order = :trade, "
+                    "medical_cases = :medical, "
                     "survivors = :survivors WHERE id = :sid"
                 ),
                 u,
@@ -255,4 +268,69 @@ def _clean_trade_order(order, conn, sid):
         if target_id is not None and target_id not in escorts:
             cleaned["pending_incident"] = None
             changed = True
+    return cleaned, changed
+
+
+# 病例合法状态：登记/治疗/隔离（活跃）与康复/病亡（终态）
+_MED_STATUSES = {"registered", "treating", "isolated", "recovered", "deceased"}
+_MED_ACTIVE = {"registered", "treating", "isolated"}
+
+
+def _clean_medical_cases(cases, conn, sid):
+    """医疗病例簿归一化。
+
+    - 整体结构损坏（非 list）：清空，巡检会重新建档
+    - 单条病例字段残缺（无 id/resident_id/合法状态）：剔除
+    - 活跃病例绑定居民不在档：整份病例剔除（悬空病例无法再结算）
+    - 活跃病例绑定居民已死亡（alive=0）：收敛为 deceased，保持病亡履历一致
+    - 同一居民多条活跃病例：仅保留最早建档的一条，其余重复病例剔除
+
+    返回 (归一化病例簿, 是否发生变化)。
+    """
+    if cases is None:
+        return None, False
+    if not isinstance(cases, list):
+        return None, True
+    known = _resident_ids(conn, sid)
+    dead_ids = {
+        row[0]
+        for row in conn.execute(
+            text("SELECT id FROM residents WHERE session_id = :sid AND alive = 0"),
+            {"sid": sid},
+        ).all()
+    }
+    cleaned = []
+    changed = False
+    active_owners = set()
+    for c in cases:
+        if not isinstance(c, dict) or not c.get("id"):
+            changed = True
+            continue
+        rid = c.get("resident_id")
+        status = c.get("status")
+        if rid is None or status not in _MED_STATUSES:
+            changed = True
+            continue
+        if rid not in known:
+            # 居民已不在档：活跃/终态病历都无法对应到人，一并剔除
+            changed = True
+            continue
+        c = dict(c)
+        if status in _MED_ACTIVE:
+            if rid in dead_ids:
+                # 居民死亡但病例仍挂活跃态：收敛为病亡
+                c["status"] = "deceased"
+                c["close_day"] = c.get("close_day")
+                changed = True
+                cleaned.append(c)
+                continue
+            if rid in active_owners:
+                # 同一居民重复的活跃病例：保留最早一条
+                changed = True
+                continue
+            active_owners.add(rid)
+        cleaned.append(c)
+    if not cleaned:
+        # 归一化后无任何病历：回 None（等价空病历），减少无意义 JSON 落库
+        return None, True
     return cleaned, changed

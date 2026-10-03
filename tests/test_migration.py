@@ -317,3 +317,118 @@ def test_trade_incident_with_dangling_target_is_dropped(db):
     order = db.get(GameSession, sid).trade_order
     assert order is not None
     assert order["pending_incident"] is None
+
+
+# ---- 医疗病例簿归一化 ----
+
+def _write_medical(sid, cases):
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE game_sessions SET medical_cases = :m WHERE id = :sid"),
+            {"m": json.dumps(cases, ensure_ascii=False), "sid": sid},
+        )
+
+
+def test_medical_cases_column_backfilled(db):
+    """缺列旧表经 ensure_schema 后补齐 medical_cases，旧行为 NULL。"""
+    gs = make_session(db)
+    db.commit()
+    db.expire_all()
+    db.execute(text("ALTER TABLE game_sessions RENAME TO gs_old"))
+    db.execute(text(
+        "CREATE TABLE game_sessions ("
+        "id INTEGER PRIMARY KEY, name VARCHAR(64), day INTEGER, target_day INTEGER, "
+        "status VARCHAR(16), resources JSON, survivors INTEGER, outcome JSON, "
+        "score INTEGER, created_at DATETIME, updated_at DATETIME)"
+    ))
+    db.execute(text(
+        "INSERT INTO game_sessions SELECT id,name,day,target_day,status,resources,"
+        "survivors,outcome,score,created_at,updated_at FROM gs_old"
+    ))
+    db.execute(text("DROP TABLE gs_old"))
+    db.commit()
+
+    ensure_schema(engine)
+    db.expire_all()
+    assert db.query(GameSession).first().medical_cases is None
+
+
+def test_corrupt_medical_cases_cleared(db):
+    """病例簿整体结构损坏（非数组）：归一化清空。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    _write_medical(sid, {"status": "treating"})
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    assert db.get(GameSession, sid).medical_cases is None
+
+
+def test_active_case_of_missing_resident_pruned(db):
+    """活跃病例绑定居民已不在档：整份病例剔除。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    cases = [
+        {"id": "c1", "resident_id": gs.residents[0].id, "status": "treating"},
+        {"id": "c2", "resident_id": 424242, "status": "isolated"},
+    ]
+    _write_medical(sid, cases)
+    reconcile_old_saves(engine)
+    db.expire_all()
+    kept = db.get(GameSession, sid).medical_cases
+    assert [c["id"] for c in kept] == ["c1"]
+
+
+def test_active_case_of_dead_resident_settled_deceased(db):
+    """居民已死亡但病例仍挂活跃态：收敛为病亡，保留履历。"""
+    gs = make_session(db)
+    gs.residents[0].alive = 0
+    db.commit()
+    sid = gs.id
+    _write_medical(sid, [
+        {"id": "c1", "resident_id": gs.residents[0].id, "status": "treating",
+         "open_day": 3, "days_cared": 2},
+    ])
+    reconcile_old_saves(engine)
+    db.expire_all()
+    kept = db.get(GameSession, sid).medical_cases
+    assert len(kept) == 1
+    assert kept[0]["status"] == "deceased"
+
+
+def test_duplicate_active_cases_for_same_resident_pruned(db):
+    """同一居民两条活跃病例：保留最早一条。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    rid = gs.residents[0].id
+    cases = [
+        {"id": "c1", "resident_id": rid, "status": "registered", "open_day": 2},
+        {"id": "c2", "resident_id": rid, "status": "treating", "open_day": 4},
+        {"id": "c3", "resident_id": gs.residents[1].id, "status": "recovered",
+         "open_day": 1, "close_day": 5},
+    ]
+    _write_medical(sid, cases)
+    assert reconcile_old_saves(engine) == 1
+    db.expire_all()
+    kept = db.get(GameSession, sid).medical_cases
+    assert [c["id"] for c in kept] == ["c1", "c3"]
+
+
+def test_valid_medical_cases_left_untouched(db):
+    """结构完整的病例簿：归一化零改写、不 bump 版本号。"""
+    gs = make_session(db)
+    db.commit()
+    sid = gs.id
+    cases = [
+        {"id": "c1", "resident_id": gs.residents[0].id, "status": "isolated",
+         "infectious": True, "open_day": 2, "days_cared": 3},
+        {"id": "c2", "resident_id": gs.residents[1].id, "status": "recovered",
+         "open_day": 1, "close_day": 4},
+    ]
+    _write_medical(sid, cases)
+    assert reconcile_old_saves(engine) == 0
+    db.expire_all()
+    kept = db.get(GameSession, sid).medical_cases
+    assert {c["id"] for c in kept} == {"c1", "c2"}

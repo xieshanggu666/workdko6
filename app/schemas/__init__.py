@@ -29,6 +29,9 @@ class ResidentOut(BaseModel):
     morale: float
     alive: int
     away: int = 0
+    # 医疗救治中心病例状态：registered/treating/isolated（终态/无病例不下发）
+    case_status: Optional[str] = None
+    case_infectious: int = 0
     # 贸易订单角色：transporting=在途押运；reviewing=待出发押运；None=无订单
     trade_status: Optional[str] = None
     joined_day: int
@@ -77,6 +80,9 @@ class SessionDetail(BaseModel):
     expedition: Optional[Dict[str, Any]] = None
     # 当前贸易/救援订单快照（审核中/在途），终局后清空
     trade_order: Optional[Dict[str, Any]] = None
+    # 医疗救治中心病例簿（登记/治疗/隔离/康复/病亡全履历）与床位概览
+    medical_cases: Optional[List[Dict[str, Any]]] = None
+    medical_summary: Optional[Dict[str, Any]] = None
     # 地堡对外信誉 0-100，影响外部聚落审核/交付
     reputation: int = 50
     residents: List[ResidentOut] = []
@@ -139,6 +145,16 @@ class TradeCancel(BaseModel):
 
 class JobAssign(BaseModel):
     job: str
+
+
+class MedicalRegister(BaseModel):
+    """医疗救治中心病例登记：传染病例建议随后转入隔离。"""
+    infectious: bool = False
+
+
+class MedicalAdmit(BaseModel):
+    """病例收治：mode=treating（治疗）/ isolated（隔离）。"""
+    mode: str
 
 
 class BuildRequest(BaseModel):

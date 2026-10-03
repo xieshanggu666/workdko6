@@ -29,6 +29,8 @@ from ..schemas import (
     TradeIncidentChoice,
     TradeCancel,
     JobAssign,
+    MedicalRegister,
+    MedicalAdmit,
     BuildRequest,
     BuildableInfo,
     EngineConfig,
@@ -100,7 +102,8 @@ def get_session(sid: int, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
-def _serialize_resident(r, away_ids=None, trade_status=None):
+def _serialize_resident(r, away_ids=None, trade_status=None, case_map=None):
+    active_case = (case_map or {}).get(r.id)
     return {
         "id": r.id,
         "name": r.name,
@@ -110,6 +113,9 @@ def _serialize_resident(r, away_ids=None, trade_status=None):
         "morale": r.morale,
         "alive": r.alive,
         "away": 1 if (away_ids and r.id in away_ids) else 0,
+        # 医疗救治中心病例状态：仅活跃病例（登记/治疗/隔离）随居民下发
+        "case_status": active_case["status"] if active_case else None,
+        "case_infectious": 1 if (active_case and active_case.get("infectious")) else 0,
         # 贸易订单角色：transporting=在途押运（按离堡结算）；reviewing=待出发押运（仍在堡）
         "trade_status": trade_status,
         "joined_day": r.joined_day,
@@ -131,8 +137,14 @@ def get_session_detail(gs, db):
         elif order.get("status") == "reviewing":
             for mid in order.get("escorts", []):
                 trade_tag[mid] = "reviewing"
+    # 活跃病例（登记/治疗/隔离）按居民编号映射，终态履历只保留在 medical_cases 中
+    med_cases = gs.medical_cases or []
+    case_map = {
+        c.get("resident_id"): c for c in med_cases
+        if c.get("status") in ("registered", "treating", "isolated")
+    }
     residents = [
-        _serialize_resident(r, away_ids, trade_tag.get(r.id))
+        _serialize_resident(r, away_ids, trade_tag.get(r.id), case_map)
         for r in gs.residents
     ]
     facilities = [
@@ -170,6 +182,9 @@ def get_session_detail(gs, db):
         pending_crisis=gs.pending_crisis,
         expedition=gs.expedition,
         trade_order=gs.trade_order,
+        medical_cases=med_cases,
+        # 床位/医护/病例计数概览（纯派生，由引擎计算保证与口径一致）
+        medical_summary=BunkerEngine(db, gs).med_summary(),
         reputation=gs.reputation if gs.reputation is not None else 50,
         residents=residents,
         facilities=facilities,
@@ -449,6 +464,30 @@ def set_job(sid: int, rid: int, body: JobAssign, db: Session = Depends(get_db)):
     return get_session_detail(gs, db)
 
 
+# ---- 医疗救治中心 ----
+@router.post("/sessions/{sid}/medical/register/{rid}", response_model=SessionDetail)
+def register_case(sid: int, rid: int, body: MedicalRegister, db: Session = Depends(get_db)):
+    """为居民登记病例（健康低于登记线且已建救治中心）。"""
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(
+        db, gs,
+        lambda eng: eng.register_case(rid, infectious=body.infectious),
+    )
+    return get_session_detail(gs, db)
+
+
+@router.post("/sessions/{sid}/medical/admit/{rid}", response_model=SessionDetail)
+def admit_case(sid: int, rid: int, body: MedicalAdmit, db: Session = Depends(get_db)):
+    """收治已登记病例：转入治疗或隔离床位（已在治者可切换方案）。"""
+    gs = db.get(GameSession, sid)
+    if not gs:
+        raise HTTPException(404, "档案不存在")
+    _run_mutation(db, gs, lambda eng: eng.admit_case(rid, body.mode))
+    return get_session_detail(gs, db)
+
+
 @router.delete("/sessions/{sid}", response_model=Message)
 def delete_session(sid: int, db: Session = Depends(get_db)):
     gs = db.get(GameSession, sid)
@@ -480,8 +519,8 @@ def list_buildable():
             cost=FACILITY_COST[1],
             level_scale=1.6,
         )
-        for k in ("farm", "water", "power", "oxygen", "med", "storage")
+        for k in ("farm", "water", "power", "oxygen", "clinic", "med", "storage")
     ]
 
 
-JOB_ZH = {"engineer": "工程师", "farmer": "农民", "general": "杂工"}
+JOB_ZH = {"engineer": "工程师", "farmer": "农民", "general": "杂工", "medic": "医护"}
